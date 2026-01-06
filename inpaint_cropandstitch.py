@@ -541,13 +541,13 @@ class InpaintCropImproved:
     # Remove the following # to turn on debug mode (extra outputs, print statements)
     #'''
     DEBUG_MODE = False
-    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK")
-    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask")
+    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK", "MASK")
+    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "cropped_mask_pre_blur")
 
     '''
     
     DEBUG_MODE = True # TODO
-    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK",
+    RETURN_TYPES = ("STITCHER", "IMAGE", "MASK", "MASK",
         # DEBUG
         "IMAGE",
         "MASK",
@@ -573,7 +573,7 @@ class InpaintCropImproved:
         "IMAGE",
         "MASK",
     )
-    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask",
+    RETURN_NAMES = ("stitcher", "cropped_image", "cropped_mask", "cropped_mask_pre_blur",
         # DEBUG
         "DEBUG_preresize_image",
         "DEBUG_preresize_mask",
@@ -696,6 +696,7 @@ class InpaintCropImproved:
         
         result_image = []
         result_mask = []
+        result_mask_pre_blur = []
 
         debug_outputs = {name: [] for name in self.RETURN_NAMES if name.startswith("DEBUG_")}
 
@@ -713,7 +714,7 @@ class InpaintCropImproved:
                 context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height,
                 output_padding, one_mask, one_optional_context_mask)
 
-            stitcher, cropped_image, cropped_mask = outputs[:3]
+            stitcher, cropped_image, cropped_mask, cropped_mask_pre_blur = outputs[:4]
             for key in ['canvas_to_orig_x', 'canvas_to_orig_y', 'canvas_to_orig_w', 'canvas_to_orig_h', 'canvas_image', 'cropped_to_canvas_x', 'cropped_to_canvas_y', 'cropped_to_canvas_w', 'cropped_to_canvas_h', 'cropped_mask_for_blend']:
                 result_stitcher[key].append(stitcher[key])
 
@@ -721,6 +722,8 @@ class InpaintCropImproved:
             result_image.append(cropped_image)
             cropped_mask = cropped_mask.clone().squeeze(0)
             result_mask.append(cropped_mask)
+            cropped_mask_pre_blur = cropped_mask_pre_blur.clone().squeeze(0)
+            result_mask_pre_blur.append(cropped_mask_pre_blur)
 
             # Handle the DEBUG_ fields dynamically
             for name, output in zip(self.RETURN_NAMES[3:], outputs[3:]):  # Start from index 3 since first 3 are fixed
@@ -730,15 +733,17 @@ class InpaintCropImproved:
 
         result_image = torch.stack(result_image, dim=0)
         result_mask = torch.stack(result_mask, dim=0)
+        result_mask_pre_blur = torch.stack(result_mask_pre_blur, dim=0)
 
         if self.DEBUG_MODE:
             print('Inpaint Crop Batch output')
             print(result_image.shape, type(result_image), result_image.dtype)
             print(result_mask.shape, type(result_mask), result_mask.dtype)
+            print(result_mask_pre_blur.shape, type(result_mask_pre_blur), result_mask_pre_blur.dtype)
 
         debug_outputs = {name: torch.stack(values, dim=0) for name, values in debug_outputs.items()}
 
-        return result_stitcher, result_image, result_mask, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
+        return result_stitcher, result_image, result_mask, result_mask_pre_blur, *[debug_outputs[name] for name in self.RETURN_NAMES if name.startswith("DEBUG_")]
 
 
     def inpaint_crop_single_image(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask, optional_context_mask):
@@ -763,6 +768,9 @@ class InpaintCropImproved:
         if self.DEBUG_MODE:
             DEBUG_invert_mask = mask.clone()
 
+        # Capture the pre-blurred mask.
+        mask_pre_blur = mask.clone()
+
         if mask_blend_pixels > 0:
             mask = expand_m(mask, mask_blend_pixels)
             mask = blur_m(mask, mask_blend_pixels*0.5)
@@ -771,12 +779,14 @@ class InpaintCropImproved:
 
         if mask_hipass_filter >= 0.01:
             mask = hipassfilter_m(mask, mask_hipass_filter)
+            mask_pre_blur = hipassfilter_m(mask_pre_blur, mask_hipass_filter)
             optional_context_mask = hipassfilter_m(optional_context_mask, mask_hipass_filter)
         if self.DEBUG_MODE:
             DEBUG_hipassfilter_mask = mask.clone()
 
         if extend_for_outpainting:
             image, mask, optional_context_mask = extend_imm(image, mask, optional_context_mask, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor)
+            _, mask_pre_blur, _ = extend_imm(image, mask_pre_blur, optional_context_mask, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor)
         if self.DEBUG_MODE:
             DEBUG_extend_image = image.clone()
             DEBUG_extend_mask = mask.clone()
@@ -809,10 +819,17 @@ class InpaintCropImproved:
             DEBUG_context_with_context_mask = context.clone()
             DEBUG_context_with_context_mask_location = debug_context_location_in_image(image, x, y, w, h)
 
+        # Create a dummy image from the mask (Shape: B,H,W,1)
+        # We use this as the "image" input to save processing the real RGB image
+        mask_pre_blur_fake_image = mask_pre_blur.unsqueeze(-1)
+
         if not output_resize_to_target_size:
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, w, h, output_padding, downscale_algorithm, upscale_algorithm)
+            _, _, _, _, _, _, cropped_mask_pre_blur, _, _, _, _ = crop_magic_im(mask_pre_blur_fake_image, mask_pre_blur, x, y, w, h, w, h, output_padding, downscale_algorithm, upscale_algorithm)
         else: # if output_resize_to_target_size:
             canvas_image, cto_x, cto_y, cto_w, cto_h, cropped_image, cropped_mask, ctc_x, ctc_y, ctc_w, ctc_h = crop_magic_im(image, mask, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
+            _, _, _, _, _, _, cropped_mask_pre_blur, _, _, _, _ = crop_magic_im(mask_pre_blur_fake_image, mask_pre_blur, x, y, w, h, output_target_width, output_target_height, output_padding, downscale_algorithm, upscale_algorithm)
+
         if self.DEBUG_MODE:
             DEBUG_context_to_target = context.clone()
             DEBUG_context_to_target_location = debug_context_location_in_image(image, x, y, w, h)
@@ -843,9 +860,9 @@ class InpaintCropImproved:
         }
 
         if not self.DEBUG_MODE:
-            return stitcher, cropped_image, cropped_mask
+            return stitcher, cropped_image, cropped_mask, cropped_mask_pre_blur
         else:
-            return stitcher, cropped_image, cropped_mask, DEBUG_preresize_image, DEBUG_preresize_mask, DEBUG_fillholes_mask, DEBUG_expand_mask, DEBUG_invert_mask, DEBUG_blur_mask, DEBUG_hipassfilter_mask, DEBUG_extend_image, DEBUG_extend_mask, DEBUG_context_from_mask, DEBUG_context_from_mask_location, DEBUG_context_expand, DEBUG_context_expand_location, DEBUG_context_with_context_mask, DEBUG_context_with_context_mask_location, DEBUG_context_to_target, DEBUG_context_to_target_location, DEBUG_context_to_target_image, DEBUG_context_to_target_mask, DEBUG_canvas_image, DEBUG_orig_in_canvas_location, DEBUG_cropped_in_canvas_location, DEBUG_cropped_mask_blend
+            return stitcher, cropped_image, cropped_mask, cropped_mask_pre_blur, DEBUG_preresize_image, DEBUG_preresize_mask, DEBUG_fillholes_mask, DEBUG_expand_mask, DEBUG_invert_mask, DEBUG_blur_mask, DEBUG_hipassfilter_mask, DEBUG_extend_image, DEBUG_extend_mask, DEBUG_context_from_mask, DEBUG_context_from_mask_location, DEBUG_context_expand, DEBUG_context_expand_location, DEBUG_context_with_context_mask, DEBUG_context_with_context_mask_location, DEBUG_context_to_target, DEBUG_context_to_target_location, DEBUG_context_to_target_image, DEBUG_context_to_target_mask, DEBUG_canvas_image, DEBUG_orig_in_canvas_location, DEBUG_cropped_in_canvas_location, DEBUG_cropped_mask_blend
 
 
 
