@@ -954,32 +954,28 @@ class InpaintCropFromStitcher:
     FUNCTION = "crop_from_stitcher"
 
     def crop_from_stitcher(self, stitcher, image=None, mask=None):
-        # 1. Basic Validation
+        # Validation
         assert image is not None or mask is not None, "InpaintCropFromStitcher requires at least an 'image' or a 'mask' input."
 
-        # 2. Get Input Sizes (Treat None as size 1 for broadcasting safety)
         img_len = image.shape[0] if image is not None else 1
         msk_len = mask.shape[0] if mask is not None else 1
         st_len = len(stitcher['canvas_to_orig_x'])
-
-        # 3. Determine Target Batch Size
         batch_size = max(img_len, msk_len, st_len)
 
-        # 4. Validate Broadcasting Rules
-        assert img_len == 1 or img_len == batch_size, f"Image batch size ({img_len}) must match target batch size ({batch_size}) or be 1."
-        assert msk_len == 1 or msk_len == batch_size, f"Mask batch size ({msk_len}) must match target batch size ({batch_size}) or be 1."
-        assert st_len == 1 or st_len == batch_size, f"Stitcher batch size ({st_len}) must match target batch size ({batch_size}) or be 1."
+        # Broadcasting Validation
+        assert img_len == 1 or img_len == batch_size, f"Image batch size ({img_len}) mismatch with ({batch_size})."
+        assert msk_len == 1 or msk_len == batch_size, f"Mask batch size ({msk_len}) mismatch with ({batch_size})."
+        assert st_len == 1 or st_len == batch_size, f"Stitcher batch size ({st_len}) mismatch with ({batch_size})."
 
         result_images = []
         result_masks = []
 
-        # 5. Process Batch
         for b in range(batch_size):
             img_idx = 0 if img_len == 1 else b
             msk_idx = 0 if msk_len == 1 else b
             st_idx = 0 if st_len == 1 else b
 
-            # Extract Stitcher Data
+            # 1. Extract Geometry
             cto_x = stitcher['canvas_to_orig_x'][st_idx]
             cto_y = stitcher['canvas_to_orig_y'][st_idx]
             cto_w = stitcher['canvas_to_orig_w'][st_idx]
@@ -990,48 +986,124 @@ class InpaintCropFromStitcher:
             ctc_w = stitcher['cropped_to_canvas_w'][st_idx]
             ctc_h = stitcher['cropped_to_canvas_h'][st_idx]
 
-            # --- FIX STARTS HERE ---
-            # Extract Reference Dimensions
-            # canvas_ref is [1, H, W, C]. We need H at [1] and W at [2].
-            canvas_ref = stitcher['canvas_image'][st_idx]
-            canvas_h, canvas_w = canvas_ref.shape[1], canvas_ref.shape[2]
+            # 2. Extract Extension Offsets (The invisible shift from extend_for_outpainting)
+            ext_x = stitcher.get('extend_offset_x', [0] * st_len)[st_idx]
+            ext_y = stitcher.get('extend_offset_y', [0] * st_len)[st_idx]
 
-            # mask_ref is [1, H, W]. We need H at [1] and W at [2].
+            # 3. Calculate Padding (Variables renamed to match extend_imm style)
+            # The 'left_padding' is where the image starts inside the expanded canvas.
+            left_padding = cto_x + ext_x
+            up_padding = cto_y + ext_y
+
+            # 4. Canvas Dimensions
+            canvas_ref = stitcher['canvas_image'][st_idx]
+            expanded_image_h, expanded_image_w = canvas_ref.shape[1], canvas_ref.shape[2]
+
+            # 5. Target Dimensions
             mask_ref = stitcher['cropped_mask_for_blend'][st_idx]
             target_h, target_w = mask_ref.shape[1], mask_ref.shape[2]
-            # --- FIX ENDS HERE ---
 
             algo = stitcher.get('upscale_algorithm', 'bicubic')
 
             # --- PROCESS IMAGE ---
             if image is not None:
-                img = image[img_idx]
+                img = image[img_idx] # [H, W, C]
+                image_h, image_w = img.shape[0], img.shape[1]
 
-                # Recreate Canvas
-                canvas_img = torch.zeros((canvas_h, canvas_w, img.shape[2]), device=img.device, dtype=img.dtype)
-                paste_h = min(cto_h, img.shape[0])
-                paste_w = min(cto_w, img.shape[1])
-                canvas_img[cto_y:cto_y+paste_h, cto_x:cto_x+paste_w, :] = img[:paste_h, :paste_w, :]
+                # Calculate remaining padding (for edge replication logic)
+                # Note: We clamp dimensions to ensure we don't calculate negative padding if image is larger than canvas 
+                # (though that shouldn't happen with valid stitchers)
+                right_padding = expanded_image_w - (left_padding + image_w)
+                down_padding = expanded_image_h - (up_padding + image_h)
+
+                # Initialize Canvas (expanded_image)
+                # crop_magic_im uses zeros for initialization
+                expanded_image = torch.zeros((expanded_image_h, expanded_image_w, img.shape[2]), device=img.device, dtype=img.dtype)
+
+                # Permute to [C, H, W] to match the slicing style of extend_imm / crop_magic_im logic
+                # (Logic works better with channels first for block assignment)
+                img_p = img.permute(2, 0, 1)
+                expanded_image_p = expanded_image.permute(2, 0, 1)
+
+                # Assign Center
+                # Ensure we stay within bounds (intersection of canvas and image)
+                slice_target_up = max(0, up_padding)
+                slice_target_down = min(expanded_image_h, up_padding + image_h)
+                slice_target_left = max(0, left_padding)
+                slice_target_right = min(expanded_image_w, left_padding + image_w)
+
+                # Corresponding source slices
+                # If padding is negative (crop), we slice the source. If positive, we slice from 0.
+                slice_source_up = max(0, -up_padding)
+                slice_source_down = min(image_h, image_h - (up_padding + image_h - expanded_image_h))
+                # Simplified: min(H, NewH - up) is usually correct, but strict mapping:
+                slice_source_down = slice_source_up + (slice_target_down - slice_target_up)
+
+                slice_source_left = max(0, -left_padding)
+                slice_source_right = slice_source_left + (slice_target_right - slice_target_left)
+
+                # Main Paste
+                if slice_target_down > slice_target_up and slice_target_right > slice_target_left:
+                    expanded_image_p[:, slice_target_up:slice_target_down, slice_target_left:slice_target_right] = \
+                        img_p[:, slice_source_up:slice_source_down, slice_source_left:slice_source_right]
+
+                # Edge Replication (Matches extend_imm logic)
+                # 1. Top
+                if up_padding > 0:
+                    expanded_image_p[:, :up_padding, slice_target_left:slice_target_right] = \
+                        img_p[:, 0:1, slice_source_left:slice_source_right].repeat(1, up_padding, 1)
+                # 2. Bottom
+                if down_padding > 0:
+                    expanded_image_p[:, -down_padding:, slice_target_left:slice_target_right] = \
+                        img_p[:, -1:, slice_source_left:slice_source_right].repeat(1, down_padding, 1)
+                # 3. Left (Replicates the ALREADY extended top/bottom parts too, just like extend_imm)
+                if left_padding > 0:
+                    expanded_image_p[:, :, :left_padding] = \
+                        expanded_image_p[:, :, left_padding:left_padding+1].repeat(1, 1, left_padding)
+                # 4. Right
+                if right_padding > 0:
+                    expanded_image_p[:, :, -right_padding:] = \
+                        expanded_image_p[:, :, -right_padding-1:-right_padding].repeat(1, 1, right_padding)
+
+                # Permute back to [H, W, C]
+                expanded_image = expanded_image_p.permute(1, 2, 0)
 
                 # Crop & Resize
-                crop_img = canvas_img[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w, :].unsqueeze(0)
+                crop_img = expanded_image[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w, :].unsqueeze(0)
                 result_images.append(rescale_i(crop_img, target_w, target_h, algo).squeeze(0))
 
             # --- PROCESS MASK ---
             if mask is not None:
                 msk = mask[msk_idx]
+                image_h, image_w = msk.shape[0], msk.shape[1]
 
-                # Recreate Canvas
-                canvas_msk = torch.zeros((canvas_h, canvas_w), device=msk.device, dtype=msk.dtype)
-                paste_h = min(cto_h, msk.shape[0])
-                paste_w = min(cto_w, msk.shape[1])
-                canvas_msk[cto_y:cto_y+paste_h, cto_x:cto_x+paste_w] = msk[:paste_h, :paste_w]
+                # Initialize Canvas (expanded_mask)
+                # crop_magic_im uses ONES for mask canvas (Matches original node behavior)
+                expanded_mask = torch.ones((expanded_image_h, expanded_image_w), device=msk.device, dtype=msk.dtype)
+
+                # Mask Paste Logic (Direct assignment, no edge replication needed for masks usually)
+                slice_target_up = max(0, up_padding)
+                slice_target_down = min(expanded_image_h, up_padding + image_h)
+                slice_target_left = max(0, left_padding)
+                slice_target_right = min(expanded_image_w, left_padding + image_w)
+
+                slice_source_up = max(0, -up_padding)
+                slice_source_left = max(0, -left_padding)
+
+                # Check valid region
+                if slice_target_down > slice_target_up and slice_target_right > slice_target_left:
+                    # Calculate exact source slice width/height to match target
+                    h_slice = slice_target_down - slice_target_up
+                    w_slice = slice_target_right - slice_target_left
+
+                    expanded_mask[slice_target_up:slice_target_down, slice_target_left:slice_target_right] = \
+                        msk[slice_source_up:slice_source_up+h_slice, slice_source_left:slice_source_left+w_slice]
 
                 # Crop & Resize
-                crop_msk = canvas_msk[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w].unsqueeze(0)
+                crop_msk = expanded_mask[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w].unsqueeze(0)
                 result_masks.append(rescale_m(crop_msk, target_w, target_h, algo).squeeze(0))
 
-        # 6. Finalize Outputs
+        # Finalize
         if result_images:
             out_image = torch.stack(result_images)
         else:
