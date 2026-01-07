@@ -928,3 +928,118 @@ class InpaintStitchImproved:
         output_image = stitch_magic_im(canvas_image, inpainted_image, mask, ctc_x, ctc_y, ctc_w, ctc_h, cto_x, cto_y, cto_w, cto_h, downscale_algorithm, upscale_algorithm)
 
         return (output_image,)
+
+
+
+
+class InpaintCropFromStitcher:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stitcher": ("STITCHER",),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+            }
+        }
+
+    CATEGORY = "inpaint"
+    DESCRIPTION = "Applies the exact crop/resize transformation defined in a Stitcher to a new image or mask batch."
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("cropped_image", "cropped_mask")
+
+    FUNCTION = "crop_from_stitcher"
+
+    def crop_from_stitcher(self, stitcher, image=None, mask=None):
+        # 1. Basic Validation
+        assert image is not None or mask is not None, "InpaintCropFromStitcher requires at least an 'image' or a 'mask' input."
+
+        # 2. Get Input Sizes (Treat None as size 1 for broadcasting safety)
+        img_len = image.shape[0] if image is not None else 1
+        msk_len = mask.shape[0] if mask is not None else 1
+        st_len = len(stitcher['canvas_to_orig_x'])
+
+        # 3. Determine Target Batch Size
+        batch_size = max(img_len, msk_len, st_len)
+
+        # 4. Validate Broadcasting Rules
+        assert img_len == 1 or img_len == batch_size, f"Image batch size ({img_len}) must match target batch size ({batch_size}) or be 1."
+        assert msk_len == 1 or msk_len == batch_size, f"Mask batch size ({msk_len}) must match target batch size ({batch_size}) or be 1."
+        assert st_len == 1 or st_len == batch_size, f"Stitcher batch size ({st_len}) must match target batch size ({batch_size}) or be 1."
+
+        result_images = []
+        result_masks = []
+
+        # 5. Process Batch
+        for b in range(batch_size):
+            img_idx = 0 if img_len == 1 else b
+            msk_idx = 0 if msk_len == 1 else b
+            st_idx = 0 if st_len == 1 else b
+
+            # Extract Stitcher Data
+            cto_x = stitcher['canvas_to_orig_x'][st_idx]
+            cto_y = stitcher['canvas_to_orig_y'][st_idx]
+            cto_w = stitcher['canvas_to_orig_w'][st_idx]
+            cto_h = stitcher['canvas_to_orig_h'][st_idx]
+
+            ctc_x = stitcher['cropped_to_canvas_x'][st_idx]
+            ctc_y = stitcher['cropped_to_canvas_y'][st_idx]
+            ctc_w = stitcher['cropped_to_canvas_w'][st_idx]
+            ctc_h = stitcher['cropped_to_canvas_h'][st_idx]
+
+            # --- FIX STARTS HERE ---
+            # Extract Reference Dimensions
+            # canvas_ref is [1, H, W, C]. We need H at [1] and W at [2].
+            canvas_ref = stitcher['canvas_image'][st_idx]
+            canvas_h, canvas_w = canvas_ref.shape[1], canvas_ref.shape[2]
+
+            # mask_ref is [1, H, W]. We need H at [1] and W at [2].
+            mask_ref = stitcher['cropped_mask_for_blend'][st_idx]
+            target_h, target_w = mask_ref.shape[1], mask_ref.shape[2]
+            # --- FIX ENDS HERE ---
+
+            algo = stitcher.get('upscale_algorithm', 'bicubic')
+
+            # --- PROCESS IMAGE ---
+            if image is not None:
+                img = image[img_idx]
+
+                # Recreate Canvas
+                canvas_img = torch.zeros((canvas_h, canvas_w, img.shape[2]), device=img.device, dtype=img.dtype)
+                paste_h = min(cto_h, img.shape[0])
+                paste_w = min(cto_w, img.shape[1])
+                canvas_img[cto_y:cto_y+paste_h, cto_x:cto_x+paste_w, :] = img[:paste_h, :paste_w, :]
+
+                # Crop & Resize
+                crop_img = canvas_img[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w, :].unsqueeze(0)
+                result_images.append(rescale_i(crop_img, target_w, target_h, algo).squeeze(0))
+
+            # --- PROCESS MASK ---
+            if mask is not None:
+                msk = mask[msk_idx]
+
+                # Recreate Canvas
+                canvas_msk = torch.zeros((canvas_h, canvas_w), device=msk.device, dtype=msk.dtype)
+                paste_h = min(cto_h, msk.shape[0])
+                paste_w = min(cto_w, msk.shape[1])
+                canvas_msk[cto_y:cto_y+paste_h, cto_x:cto_x+paste_w] = msk[:paste_h, :paste_w]
+
+                # Crop & Resize
+                crop_msk = canvas_msk[ctc_y:ctc_y+ctc_h, ctc_x:ctc_x+ctc_w].unsqueeze(0)
+                result_masks.append(rescale_m(crop_msk, target_w, target_h, algo).squeeze(0))
+
+        # 6. Finalize Outputs
+        if result_images:
+            out_image = torch.stack(result_images)
+        else:
+            out_image = torch.zeros((batch_size, target_h, target_w, 3))
+
+        if result_masks:
+            out_mask = torch.stack(result_masks)
+        else:
+            out_mask = torch.zeros((batch_size, target_h, target_w))
+
+        return (out_image, out_mask)
